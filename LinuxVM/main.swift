@@ -2,26 +2,26 @@ import Foundation
 import Virtualization
 
 let createCmdName = "create"
+let runCmdName = "run"
+let userConfigFileName = "UserConfig.json"
 
-let shouldCreate = CommandLine.argc > 1 && CommandLine.arguments[1] == createCmdName
+guard CommandLine.argc == 3 else {
+    fatalError("Invalid arguments.")
+}
 
-// User-provided configuration
-let vmName = "UbuntuServer"
-let baseDir = "/Users/markopapic/VMs/"
-let diskSizeGB = UInt64(64)
-let cpuCount = 4
-let memorySizeGB = UInt64(8)
-let installerISOPath = URL(fileURLWithPath: "/Users/markopapic/Downloads/ubuntu-22.04.2-live-server-arm64.iso")
-
-let vmDir = baseDir + vmName + "/"
-let mainDiskImagePath = vmDir + "Disk.img"
-let machineIDPath = vmDir + "MachineIdentifier"
-let memorySize = memorySizeGB  * 1024 * 1024 * 1024
-let efiVariableStorePath = vmDir + "NVRAM"
+let command = CommandLine.arguments[1]
+let userConfigJson = readUserConfig()
+let userConfig = UserConfig(fromJson: userConfigJson)
 
 // MARK: Create the Virtual Machine
 
-let vm = createVM()
+// Save user config to be used for subsequent runs
+if command == createCmdName {
+    createVMDir(path: userConfig.vmDir)
+    FileManager.default.createFile(atPath: userConfig.vmDir + userConfigFileName, contents: userConfigJson.data(using: .utf8)!, attributes: nil)
+}
+
+let vm = createVM(userConfig: userConfig, shouldCreate: command == createCmdName)
 
 let delegate = Delegate()
 vm.delegate = delegate
@@ -52,34 +52,30 @@ extension Delegate: VZVirtualMachineDelegate {
 
 // MARK: - Helper Functions
 
-func createVM() -> VZVirtualMachine {
-    validateCPUCount()
-    validateMemorySize()
-    
+func createVM(userConfig: UserConfig, shouldCreate: Bool) -> VZVirtualMachine {
     let platform = VZGenericPlatformConfiguration()
     let bootLoader = VZEFIBootLoader()
     let disksArray = NSMutableArray()
     
     if shouldCreate {
         print("Creating virtual machine...")
-        createVMDir()
-        createMainDiskImage()
-        platform.machineIdentifier = createMachineID()
-        bootLoader.variableStore = createBootloaderStore()
-        disksArray.add(createBootableIsoUsbConfiguration())
+        createMainDiskImage(path: userConfig.mainDiskImagePath, size: userConfig.diskSize)
+        platform.machineIdentifier = createMachineID(path: userConfig.machineIDPath)
+        bootLoader.variableStore = createBootloaderStore(path: userConfig.efiVariableStorePath)
+        disksArray.add(createBootableIsoUsbConfiguration(installerISOPath: userConfig.installerISOPath))
     } else {
-        platform.machineIdentifier = getMachineID()
-        bootLoader.variableStore = getBootloaderStore()
+        platform.machineIdentifier = getMachineID(path: userConfig.machineIDPath)
+        bootLoader.variableStore = getBootloaderStore(path: userConfig.efiVariableStorePath)
     }
     
     let vmConfig = VZVirtualMachineConfiguration()
     
-    vmConfig.cpuCount = cpuCount
-    vmConfig.memorySize = memorySize
+    vmConfig.cpuCount = userConfig.cpuCount
+    vmConfig.memorySize = userConfig.memorySize
     vmConfig.platform = platform
     vmConfig.bootLoader = bootLoader
 
-    disksArray.add(createBlockDeviceConfiguration())
+    disksArray.add(createBlockDeviceConfiguration(path: userConfig.mainDiskImagePath))
     guard let disks = disksArray as? [VZStorageDeviceConfiguration] else {
         fatalError("Invalid disksArray.")
     }
@@ -95,34 +91,34 @@ func createVM() -> VZVirtualMachine {
     return vm
 }
 
-func createVMDir() {
+func createVMDir(path: String) {
     do {
-        try FileManager.default.createDirectory(atPath: vmDir, withIntermediateDirectories: false)
+        try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: false)
     } catch {
         fatalError("Failed to create “GUI Linux VM.bundle.”")
     }
 }
 
 // Create an empty disk image for the virtual machine
-func createMainDiskImage() {
-    let diskCreated = FileManager.default.createFile(atPath: mainDiskImagePath, contents: nil, attributes: nil)
+func createMainDiskImage(path: String, size: UInt64) {
+    let diskCreated = FileManager.default.createFile(atPath: path, contents: nil, attributes: nil)
     if !diskCreated {
         fatalError("Failed to create the main disk image.")
     }
 
-    guard let mainDiskFileHandle = try? FileHandle(forWritingTo: URL(fileURLWithPath: mainDiskImagePath)) else {
+    guard let mainDiskFileHandle = try? FileHandle(forWritingTo: URL(fileURLWithPath: path)) else {
         fatalError("Failed to get the file handle for the main disk image.")
     }
 
     do {
-        try mainDiskFileHandle.truncate(atOffset: diskSizeGB * 1024 * 1024 * 1024)
+        try mainDiskFileHandle.truncate(atOffset: size)
     } catch {
         fatalError("Failed to truncate the main disk image.")
     }
 }
 
-func createBlockDeviceConfiguration() -> VZVirtioBlockDeviceConfiguration {
-    guard let mainDiskAttachment = try? VZDiskImageStorageDeviceAttachment(url: URL(fileURLWithPath: mainDiskImagePath), readOnly: false) else {
+func createBlockDeviceConfiguration(path: String) -> VZVirtioBlockDeviceConfiguration {
+    guard let mainDiskAttachment = try? VZDiskImageStorageDeviceAttachment(url: URL(fileURLWithPath: path), readOnly: false) else {
         fatalError("Failed to create main disk attachment.")
     }
 
@@ -130,29 +126,15 @@ func createBlockDeviceConfiguration() -> VZVirtioBlockDeviceConfiguration {
     return mainDisk
 }
 
-func validateCPUCount() {
-    let availableCPUs = ProcessInfo.processInfo.processorCount
-    
-    if cpuCount > availableCPUs {
-        fatalError("Only CPU count is \(availableCPUs).")
-    }
-}
-
-func validateMemorySize() {
-    if memorySize < VZVirtualMachineConfiguration.minimumAllowedMemorySize || memorySize > VZVirtualMachineConfiguration.maximumAllowedMemorySize {
-        fatalError("Memory size should be between \(VZVirtualMachineConfiguration.minimumAllowedMemorySize) and \(VZVirtualMachineConfiguration.maximumAllowedMemorySize).")
-    }
-}
-
-func createMachineID() -> VZGenericMachineIdentifier {
+func createMachineID(path: URL) -> VZGenericMachineIdentifier {
     let machineID = VZGenericMachineIdentifier()
-    try! machineID.dataRepresentation.write(to: URL(fileURLWithPath: machineIDPath))
+    try! machineID.dataRepresentation.write(to: path)
     
     return machineID
 }
 
-func getMachineID() -> VZGenericMachineIdentifier {
-    guard let machineIDData = try? Data(contentsOf: URL(fileURLWithPath: machineIDPath)) else {
+func getMachineID(path: URL) -> VZGenericMachineIdentifier {
+    guard let machineIDData = try? Data(contentsOf: path) else {
         fatalError("Failed to read the machine identifier.")
     }
 
@@ -163,7 +145,7 @@ func getMachineID() -> VZGenericMachineIdentifier {
     return machineId
 }
 
-func createBootableIsoUsbConfiguration() -> VZUSBMassStorageDeviceConfiguration {
+func createBootableIsoUsbConfiguration(installerISOPath: URL) -> VZUSBMassStorageDeviceConfiguration {
     guard let intallerDiskAttachment = try? VZDiskImageStorageDeviceAttachment(url: installerISOPath, readOnly: true) else {
         fatalError("Failed to create installer's disk attachment.")
     }
@@ -171,20 +153,20 @@ func createBootableIsoUsbConfiguration() -> VZUSBMassStorageDeviceConfiguration 
     return VZUSBMassStorageDeviceConfiguration(attachment: intallerDiskAttachment)
 }
 
-func createBootloaderStore() -> VZEFIVariableStore {
-    guard let efiVariableStore = try? VZEFIVariableStore(creatingVariableStoreAt: URL(fileURLWithPath: efiVariableStorePath)) else {
+func createBootloaderStore(path: String) -> VZEFIVariableStore {
+    guard let efiVariableStore = try? VZEFIVariableStore(creatingVariableStoreAt: URL(fileURLWithPath: path)) else {
         fatalError("Failed to create the EFI variable store.")
     }
 
     return efiVariableStore
 }
 
- func getBootloaderStore() -> VZEFIVariableStore {
-    if !FileManager.default.fileExists(atPath: efiVariableStorePath) {
+func getBootloaderStore(path: String) -> VZEFIVariableStore {
+    if !FileManager.default.fileExists(atPath: path) {
         fatalError("Failed to read the EFI variable store.")
     }
 
-    return VZEFIVariableStore(url: URL(fileURLWithPath: efiVariableStorePath))
+    return VZEFIVariableStore(url: URL(fileURLWithPath: path))
 }
 
 func createNetworkDeviceConfiguration() -> VZVirtioNetworkDeviceConfiguration {
@@ -218,7 +200,65 @@ func createConsoleConfiguration() -> VZSerialPortConfiguration {
     return consoleConfiguration
 }
 
-func printUsageAndExit() -> Never {
-    print("Usage: \(CommandLine.arguments[0]) <kernel-path> <initial-ramdisk-path>")
-    exit(EX_USAGE)
+func readUserConfig() -> String {
+    let command = CommandLine.arguments[1]
+
+    var userConfigPath : String
+    if command == createCmdName {
+        userConfigPath = CommandLine.arguments[2] // JSON path
+    } else if command == runCmdName {
+        userConfigPath = CommandLine.arguments[2] + "/" + userConfigFileName // VM dir path
+    } else {
+        fatalError("Unrecognized command.")
+    }
+
+    let userConfigJson = try! String(contentsOfFile: userConfigPath)
+    
+    return userConfigJson
+}
+
+// MARK: - Data Models
+
+struct UserConfig {
+    var vmDir: String
+    var mainDiskImagePath: String
+    var diskSize: UInt64
+    var cpuCount: Int
+    var memorySize: UInt64 // multiply
+    var installerISOPath: URL
+    var machineIDPath: URL
+    var efiVariableStorePath: String
+    
+    init(fromJson json: String) {
+        let data = json.data(using: .utf8)!
+        let dict = try! JSONSerialization.jsonObject(with: data, options: .allowFragments) as! [String: Any]
+        
+        
+        let vmName = dict["name"] as! String
+        let baseDir = dict["dir"] as! String
+        vmDir = baseDir + vmName + "/"
+        
+        mainDiskImagePath = vmDir + "Disk.img"
+        
+        let diskSizeGB = dict["diskSize"] as! UInt64
+        diskSize = diskSizeGB * 1024 * 1024 * 1024
+        
+        let desiredCpuCount = dict["cpuCount"] as! Int
+        let availableCPUs = ProcessInfo.processInfo.processorCount
+        if desiredCpuCount > availableCPUs {
+            fatalError("Max CPU count is \(availableCPUs).")
+        }
+        cpuCount = desiredCpuCount
+        
+        let desiredMemorySizeGB = dict["memorySize"] as! UInt64
+        let desiredMemorySize = desiredMemorySizeGB  * 1024 * 1024 * 1024
+        if desiredMemorySize < VZVirtualMachineConfiguration.minimumAllowedMemorySize || desiredMemorySize > VZVirtualMachineConfiguration.maximumAllowedMemorySize {
+            fatalError("Memory size should be between \(VZVirtualMachineConfiguration.minimumAllowedMemorySize) and \(VZVirtualMachineConfiguration.maximumAllowedMemorySize).")
+        }
+        memorySize = desiredMemorySize
+        
+        installerISOPath = URL(fileURLWithPath: dict["installerISO"] as! String)
+        machineIDPath = URL(fileURLWithPath: vmDir + "MachineIdentifier")
+        efiVariableStorePath = vmDir + "NVRAM"
+    }
 }
